@@ -1,9 +1,13 @@
 [project]
 name = "expense-tracker-mcp-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Personal finance tracker implementing the 50/30/20 budgeting rule, powered by FastMCP and Turso."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastmcp>=2.14.5",
+    "libsql>=0.1.11",
 ]
+
+[project.scripts]
+expense-tracker = "main:mcp.run"

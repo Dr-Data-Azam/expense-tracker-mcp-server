@@ -17,10 +17,17 @@ Tools (17 total):
 import calendar
 import csv
 import io
+import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
+
+try:
+    import libsql
+    _LIBSQL_AVAILABLE = True
+except ImportError:
+    _LIBSQL_AVAILABLE = False
 
 from fastmcp import FastMCP
 
@@ -51,22 +58,115 @@ for _c in SAVINGS_CATEGORIES:
 # Database helpers
 # ---------------------------------------------------------------------------
 
-DB_PATH = Path(__file__).parent / "expenses.db"
+_LOCAL_DB_PATH = Path(__file__).parent / "expenses.db"
 
 
-def _get_connection() -> sqlite3.Connection:
-    """Return a SQLite connection with WAL mode, row_factory, and FK support."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+class _Row:
+    """Wraps a libsql tuple row so columns can be accessed by name (row["col"])."""
+
+    __slots__ = ("_data", "_index")
+
+    def __init__(self, row: tuple, description: list) -> None:
+        self._data = row
+        self._index = {col[0]: i for i, col in enumerate(description)}
+
+    def __getitem__(self, key: str | int):
+        if isinstance(key, int):
+            return self._data[key]
+        return self._data[self._index[key]]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
 
 
-def _db_error(e: sqlite3.Error) -> str:
+class _Connection:
+    """
+    Thin wrapper around either a libsql or sqlite3 connection that:
+    - Makes fetchone()/fetchall() return _Row objects (named column access).
+    - Supports the context manager protocol (with _get_connection() as conn).
+    """
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    # ── context manager ──────────────────────────────────────────────────────
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self._conn.commit()
+        self._conn.close()
+        return False
+
+    # ── delegation helpers ────────────────────────────────────────────────────
+
+    def execute(self, sql: str, params=()) -> "_Cursor":
+        raw = self._conn.execute(sql, params)
+        return _Cursor(raw)
+
+    def commit(self):
+        self._conn.commit()
+
+    def sync(self):
+        if hasattr(self._conn, "sync"):
+            self._conn.sync()
+
+    def close(self):
+        self._conn.close()
+
+
+class _Cursor:
+    """Wraps a raw cursor so fetchone/fetchall return _Row instances."""
+
+    def __init__(self, cursor) -> None:
+        self._cursor = cursor
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        desc = self._cursor.description or []
+        return _Row(tuple(row), desc)
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        desc = self._cursor.description or []
+        return [_Row(tuple(r), desc) for r in rows]
+
+    def __iter__(self):
+        desc = self._cursor.description or []
+        for row in self._cursor:
+            yield _Row(tuple(row), desc)
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+
+def _get_connection() -> _Connection:
+    """Return a connection — Turso (cloud) when env vars are set, local SQLite otherwise."""
+    url = os.getenv("TURSO_DATABASE_URL")
+    token = os.getenv("TURSO_AUTH_TOKEN")
+
+    if url and token and _LIBSQL_AVAILABLE:
+        raw = libsql.connect(":memory:", sync_url=url, auth_token=token)
+    else:
+        raw = sqlite3.connect(_LOCAL_DB_PATH)
+        raw.execute("PRAGMA journal_mode=WAL")
+        raw.execute("PRAGMA synchronous=NORMAL")
+        raw.execute("PRAGMA foreign_keys=ON")
+
+    return _Connection(raw)
+
+
+def _db_error(e: Exception) -> str:
     """Return a user-friendly database error message."""
-    return f"Database error: {e}. Please try again or check expenses.db."
+    return f"Database error: {e}. Please try again or check your database."
 
 
 def _cents(amount: float) -> int:
@@ -151,6 +251,7 @@ def _init_db() -> None:
             """
         )
         conn.commit()
+        conn.sync()
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +324,9 @@ def add_transaction(
                 (type, category, amount, description, date_str),
             )
             conn.commit()
+            conn.sync()
             row_id = cursor.lastrowid
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     bucket = CATEGORY_TO_BUCKET.get(category, "") if type == "Expense" else ""
@@ -264,7 +366,8 @@ def delete_transaction(transaction_id: int) -> str:
                 "DELETE FROM transactions WHERE id = ?", (transaction_id,)
             )
             conn.commit()
-    except sqlite3.Error as e:
+            conn.sync()
+    except Exception as e:
         return _db_error(e)
 
     return (
@@ -339,7 +442,8 @@ def edit_transaction(
                 (new_amount, new_category, new_description, new_date, transaction_id),
             )
             conn.commit()
-    except sqlite3.Error as e:
+            conn.sync()
+    except Exception as e:
         return _db_error(e)
 
     bucket = CATEGORY_TO_BUCKET.get(new_category, "") if row["type"] == "Expense" else ""
@@ -380,7 +484,7 @@ def get_balance() -> str:
                 FROM transactions
                 """
             ).fetchone()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     total_income:   float = row["total_income"]
@@ -432,7 +536,7 @@ def get_balance_for_period(start_date: str, end_date: str) -> str:
                 """,
                 (start_str, end_str),
             ).fetchone()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     total_income:   float = row["total_income"]
@@ -498,7 +602,7 @@ def get_budget_status(year: int | None = None, month: int | None = None) -> str:
                 "GROUP BY category",
                 (start, end),
             ).fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     if total_income == 0:
@@ -615,12 +719,13 @@ def set_budget_limit(category: str, monthly_limit: float) -> str:
                 (category, monthly_limit, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
             conn.commit()
+            conn.sync()
             spent_row = conn.execute(
                 "SELECT COALESCE(SUM(amount), 0) AS spent FROM transactions "
                 "WHERE type='Expense' AND category=? AND date >= ? AND date <= ?",
                 (category, start, end),
             ).fetchone()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     spent = spent_row["spent"]
@@ -664,7 +769,7 @@ def get_budget_alerts() -> str:
                 "GROUP BY category",
                 (start, end),
             ).fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     spent_map = {r["category"]: r["spent"] for r in spent_rows}
@@ -743,7 +848,7 @@ def get_summary_by_period(year: int, month: int = 0) -> str:
                 "ORDER BY type DESC, total DESC",
                 (start, end),
             ).fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     if not rows:
@@ -853,7 +958,7 @@ def get_spending_trends(months: int = 6, category: str | None = None) -> str:
                     expense = row["exp"]
 
                 results.append({"label": lbl, "income": income, "expense": expense})
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     title = f"Spending Trends — Last {months} Months"
@@ -947,7 +1052,7 @@ def get_top_categories(
                 f"SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE {where_sql}",
                 params,
             ).fetchone()[0]
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     if not rows:
@@ -1052,7 +1157,7 @@ def search_transactions(
                 f"ORDER BY date DESC LIMIT ?",
                 params + [limit],
             ).fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     if not rows:
@@ -1103,7 +1208,7 @@ def list_recent_transactions(
                 f"FROM transactions {where} ORDER BY id DESC LIMIT ?",
                 params + [limit],
             ).fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     if not rows:
@@ -1183,8 +1288,9 @@ def add_recurring_transaction(
                 (type, category, amount, description, frequency, start_date),
             )
             conn.commit()
+            conn.sync()
             row_id = cursor.lastrowid
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     return (
@@ -1265,7 +1371,8 @@ def apply_due_recurring_transactions() -> str:
                 )
 
             conn.commit()
-    except sqlite3.Error as e:
+            conn.sync()
+    except Exception as e:
         return _db_error(e)
 
     return (
@@ -1288,7 +1395,7 @@ def list_recurring_transactions() -> str:
                 "next_due_date, last_applied "
                 "FROM recurring_transactions WHERE is_active=1 ORDER BY next_due_date"
             ).fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     if not rows:
@@ -1369,7 +1476,7 @@ def export_transactions_csv(
                 f"FROM transactions {where_sql} ORDER BY date ASC",
                 params,
             ).fetchall()
-    except sqlite3.Error as e:
+    except Exception as e:
         return _db_error(e)
 
     if not rows:

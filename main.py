@@ -154,7 +154,8 @@ def _get_connection() -> _Connection:
     token = os.getenv("TURSO_AUTH_TOKEN")
 
     if url and token and _LIBSQL_AVAILABLE:
-        raw = libsql.connect(":memory:", sync_url=url, auth_token=token)
+        # Direct remote connection to Turso — no local file, no WAL
+        raw = libsql.connect(database=url, auth_token=token)
     else:
         raw = sqlite3.connect(_LOCAL_DB_PATH)
         raw.execute("PRAGMA journal_mode=WAL")

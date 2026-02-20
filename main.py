@@ -114,7 +114,10 @@ class _Connection:
 
     def sync(self):
         if hasattr(self._conn, "sync"):
-            self._conn.sync()
+            try:
+                self._conn.sync()
+            except Exception:
+                pass  # Remote connections don't support sync — safe to ignore
 
     def close(self):
         self._conn.close()
